@@ -1015,7 +1015,16 @@ function filterPools(pools) {
       return true;
     })();
 
-    return meetsFeeCriteria && meetsCollectMode && meetsDexCriteria && meetsPumpfunCriteria;
+    // Tambahan logika untuk first_pool pumpfun-amm
+    const meetsFirstPoolCriteria = (() => {
+      if (pool.dex === "pumpfun-amm" && pool.first_pool) {
+        // Skip jika first_pool TIDAK berakhiran "pump"
+        return /pump$/.test(pool.first_pool);
+      }
+      return true; // Untuk dex lain, lolos filter
+    })();
+
+    return meetsFeeCriteria && meetsCollectMode && meetsDexCriteria && meetsPumpfunCriteria && meetsFirstPoolCriteria;
   });
 }
 

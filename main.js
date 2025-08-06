@@ -12,6 +12,7 @@ import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
   getAssociatedTokenAddressSync,
   getMint,
+  getAccount  // ← Tambahkan ini
 } from "@solana/spl-token";
 
 // === CORRECTED IMPORTS (Only what's actually used) ===
@@ -51,14 +52,14 @@ const SOL_MINT = "So11111111111111111111111111111111111111112";
 const DEX_SWAP_AMOUNTS = {
   // DEX names dan swap amount dalam SOL
   "pumpfun-amm": 0.05,
-  "raydium-clmm": 0.03,
+  "raydium-clmm": 0.04,
   "raydium-cp-swaps": 0.03,
-  "jup-studio": 0.03,
+  "jup-studio": 0.01,
   "meteora-damm-v2": 0.03,
   "pumpfun": 0.01,
   "moonit-cp": 0.01,
   "moonshot": 0.01,
-  "default": 0.025              // Default amount jika DEX tidak dikenal
+  "default": 0.01              // Default amount jika DEX tidak dikenal
 };
 
 // === KONFIGURASI DAMM BOT ===
@@ -362,7 +363,7 @@ function tokenAmountToHuman(tokenAmount, decimals) {
   return parseFloat(tokenAmount.toString()) / Math.pow(10, decimals);
 }
 
-// === FIX 2: Enhanced Recovery Function ===
+// === ENHANCED Recovery Function dengan Sequential Balance Check ===
 async function swapBackToSOL(tokenMint, poolSymbol) {
   // ✅ Handle null/undefined poolSymbol
   let safePoolSymbol = poolSymbol;
@@ -379,27 +380,137 @@ async function swapBackToSOL(tokenMint, poolSymbol) {
     wasNull: !poolSymbol
   });
 
-  const tokenBalance = await getTokenBalance(tokenMint, true);
-  if (tokenBalance.isZero()) {
-    logWarning('RECOVERY', `No ${safePoolSymbol} balance to swap back`, {
-      tokenMint,
-      poolSymbol: safePoolSymbol
+  // ✅ ENHANCED BALANCE CHECK untuk Recovery dengan Sequential Fallback
+  logActivity('RECOVERY', `Starting robust balance check for recovery`, {
+    tokenMint,
+    poolSymbol: safePoolSymbol
+  });
+
+  let tokenBalance;
+  try {
+    // ✅ STEP 1: Try normal getTokenBalance first
+    logActivity('RECOVERY', `Step 1: Trying normal recovery balance check for ${safePoolSymbol}`, {
+      tokenMint: tokenMint.slice(0, 8) + '...',
+      method: 'normal'
     });
-    return null;
+
+    tokenBalance = await getTokenBalance(tokenMint, true);
+    
+    if (!tokenBalance.isZero()) {
+      logSuccess('RECOVERY', `Step 1: Normal recovery balance check successful`, {
+        poolSymbol: safePoolSymbol,
+        balance: tokenBalance.toString(),
+        method: 'normal'
+      });
+    } else {
+      logWarning('RECOVERY', `Step 1: Normal method returned zero balance`, {
+        poolSymbol: safePoolSymbol
+      });
+      throw new Error("Normal method returned zero balance");
+    }
+    
+  } catch (normalError) {
+    const isAccountNotFoundError = normalError.message.includes('could not find account') || 
+                                   normalError.message.includes('zero balance');
+    
+    logWarning('RECOVERY', `Step 1: Normal recovery method failed`, {
+      error: normalError.message,
+      isTargetError: isAccountNotFoundError,
+      willTryRobust: isAccountNotFoundError
+    });
+
+    if (isAccountNotFoundError) {
+      // ✅ STEP 2: Try robust method with RPC2
+      logActivity('RECOVERY', `Step 2: Trying robust recovery method with RPC2 for ${safePoolSymbol}`, {
+        reason: 'Normal method failed to find account or returned zero'
+      });
+
+      try {
+        const robustBalanceBN = await getUserTokenBalanceRobust(connection2, tokenMint, wallet.publicKey);
+        
+        if (!robustBalanceBN.isZero()) {
+          tokenBalance = robustBalanceBN;
+          logSuccess('RECOVERY', `Step 2: Robust RPC2 recovery method successful`, {
+            poolSymbol: safePoolSymbol,
+            balance: tokenBalance.toString(),
+            method: 'robust_rpc2'
+          });
+        } else {
+          logWarning('RECOVERY', `Step 2: Robust RPC2 returned zero balance`);
+        }
+        
+      } catch (robustRpc2Error) {
+        logWarning('RECOVERY', `Step 2: Robust RPC2 recovery method failed`, {
+          error: robustRpc2Error.message
+        });
+      }
+
+      // ✅ STEP 3: Try robust method with RPC1 (final fallback)
+      if (!tokenBalance || tokenBalance.isZero()) {
+        logActivity('RECOVERY', `Step 3: Trying robust recovery method with RPC1 for ${safePoolSymbol}`, {
+          reason: 'RPC2 robust method also failed'
+        });
+
+        try {
+          const robustBalanceBN = await getUserTokenBalanceRobust(connection, tokenMint, wallet.publicKey);
+          
+          if (!robustBalanceBN.isZero()) {
+            tokenBalance = robustBalanceBN;
+            logSuccess('RECOVERY', `Step 3: Robust RPC1 recovery method successful`, {
+              poolSymbol: safePoolSymbol,
+              balance: tokenBalance.toString(),
+              method: 'robust_rpc1'
+            });
+          } else {
+            logWarning('RECOVERY', `Step 3: Robust RPC1 returned zero balance`);
+          }
+          
+        } catch (robustRpc1Error) {
+          logError('RECOVERY', `Step 3: Final robust recovery method failed`, robustRpc1Error);
+        }
+      }
+
+      // ✅ All robust methods failed or returned zero
+      if (!tokenBalance || tokenBalance.isZero()) {
+        logWarning('RECOVERY', `All recovery balance check methods failed or returned zero for ${safePoolSymbol}`, {
+          tokenMint,
+          poolSymbol: safePoolSymbol,
+          finalBalance: tokenBalance ? tokenBalance.toString() : '0'
+        });
+        return null;
+      }
+      
+    } else {
+      // ✅ Different error - log and return null
+      logError('RECOVERY', `Recovery balance check failed with non-target error`, normalError, {
+        tokenMint,
+        poolSymbol: safePoolSymbol
+      });
+      return null;
+    }
   }
 
-  // ✅ Use proper decimals instead of hardcoded 9
+  // ✅ Balance check completed successfully
+  logSuccess('RECOVERY', `Recovery balance check completed successfully`, {
+    tokenMint: tokenMint.slice(0, 8) + '...',
+    poolSymbol: safePoolSymbol,
+    balance: tokenBalance.toString()
+  });
+
+  // ✅ Get proper decimals instead of hardcoded 9
   let tokenDecimals = 9;
   try {
     const mintInfo = await getMint(connection, new PublicKey(tokenMint));
     tokenDecimals = mintInfo.decimals;
   } catch (error) {
-    console.log(`⚠️ Could not get decimals for ${tokenMint}, using 9`);
+    logWarning('RECOVERY', `Could not get decimals for ${tokenMint}, using 9`, {
+      tokenMint: tokenMint.slice(0, 8) + '...'
+    });
   }
 
   const tokenBalanceHuman = tokenAmountToHuman(tokenBalance, tokenDecimals);
   logActivity('RECOVERY', `Attempting to swap ${tokenBalanceHuman} ${safePoolSymbol} → SOL`, {
-    tokenMint,
+    tokenMint: tokenMint.slice(0, 8) + '...',
     balance: tokenBalanceHuman,
     balanceRaw: tokenBalance.toString(),
     decimals: tokenDecimals
@@ -408,10 +519,29 @@ async function swapBackToSOL(tokenMint, poolSymbol) {
   const recoverySwapOperation = async () => {
     logActivity('RECOVERY', `Executing recovery swap: ${safePoolSymbol} → SOL`);
 
-    const currentBalance = await getTokenBalance(tokenMint, true);
-    if (currentBalance.isZero()) {
-      throw new Error("Token balance is zero, cannot proceed with recovery");
+    // ✅ Re-check balance before swap (could have changed)
+    let currentBalance;
+    try {
+      // Try robust balance check again before swap
+      currentBalance = await getUserTokenBalanceRobust(connection2, tokenMint, wallet.publicKey);
+      if (currentBalance.isZero()) {
+        // Try RPC1 as fallback
+        currentBalance = await getUserTokenBalanceRobust(connection, tokenMint, wallet.publicKey);
+      }
+    } catch (error) {
+      // Fallback to original method
+      currentBalance = await getTokenBalance(tokenMint, true);
     }
+
+    if (currentBalance.isZero()) {
+      throw new Error("Token balance became zero, cannot proceed with recovery");
+    }
+
+    logActivity('RECOVERY', `Pre-swap balance verification`, {
+      poolSymbol: safePoolSymbol,
+      currentBalance: tokenAmountToHuman(currentBalance, tokenDecimals),
+      balanceRaw: currentBalance.toString()
+    });
 
     const taker = wallet.publicKey.toBase58();
     const orderUrl = `https://ultra-api.jup.ag/order?inputMint=${tokenMint}&outputMint=${SOL_MINT}&amount=${currentBalance.toString()}&taker=${taker}&swapMode=ExactIn`;
@@ -451,7 +581,19 @@ async function swapBackToSOL(tokenMint, poolSymbol) {
     logActivity('RECOVERY', `Verifying recovery swap for ${safePoolSymbol}`);
     await new Promise(resolve => setTimeout(resolve, 2000));
 
-    const balanceAfter = await getTokenBalance(tokenMint, true);
+    // ✅ Use robust balance check for verification too
+    let balanceAfter;
+    try {
+      balanceAfter = await getUserTokenBalanceRobust(connection2, tokenMint, wallet.publicKey);
+      if (balanceAfter.isZero()) {
+        // Try RPC1 as verification
+        balanceAfter = await getUserTokenBalanceRobust(connection, tokenMint, wallet.publicKey);
+      }
+    } catch (error) {
+      // Fallback to original method
+      balanceAfter = await getTokenBalance(tokenMint, true);
+    }
+
     const swapSucceeded = balanceAfter.lt(tokenBalance);
 
     if (swapSucceeded) {
@@ -477,7 +619,7 @@ async function swapBackToSOL(tokenMint, poolSymbol) {
       `Recovery Swap (${safePoolSymbol} → SOL)`,
       'RECOVERY',
       {
-        tokenMint,
+        tokenMint: tokenMint.slice(0, 8) + '...',
         poolSymbol: safePoolSymbol,
         initialBalance: tokenBalanceHuman
       },
@@ -488,7 +630,7 @@ async function swapBackToSOL(tokenMint, poolSymbol) {
       logSuccess('RECOVERY', `Recovery completed: ${safePoolSymbol} → SOL`, {
         signature,
         recoveredAmount: tokenBalanceHuman,
-        tokenMint
+        tokenMint: tokenMint.slice(0, 8) + '...'
       });
       return signature;
     } else if (signature === "verified_success") {
@@ -502,18 +644,29 @@ async function swapBackToSOL(tokenMint, poolSymbol) {
     return null;
 
   } catch (error) {
-    const finalBalance = await getTokenBalance(tokenMint, true);
+    // ✅ Final balance check with robust method
+    let finalBalance;
+    try {
+      finalBalance = await getUserTokenBalanceRobust(connection2, tokenMint, wallet.publicKey);
+      if (finalBalance.isZero()) {
+        finalBalance = await getUserTokenBalanceRobust(connection, tokenMint, wallet.publicKey);
+      }
+    } catch (balanceError) {
+      finalBalance = await getTokenBalance(tokenMint, true);
+    }
+
     const finalBalanceHuman = tokenAmountToHuman(finalBalance, tokenDecimals);
 
     logError('RECOVERY', `Recovery failed: ${safePoolSymbol} tokens may be stuck`, error, {
       poolSymbol: safePoolSymbol,
-      tokenMint,
+      tokenMint: tokenMint.slice(0, 8) + '...',
       stuckAmount: finalBalanceHuman,
-      note: 'Manual intervention needed'
+      note: 'Manual intervention needed - tokens may still be recoverable with robust balance check'
     });
 
     console.log(`  ⚠️ ${safePoolSymbol} tokens may remain in wallet - manual intervention needed`);
-    console.log(`  📊 Stuck tokens: ${finalBalanceHuman} ${safePoolSymbol} (${tokenMint})`);
+    console.log(`  📊 Stuck tokens: ${finalBalanceHuman} ${safePoolSymbol} (${tokenMint.slice(0, 8)}...)`);
+    console.log(`  💡 Try manual recovery with comprehensive token account scan`);
 
     return null;
   }
@@ -700,6 +853,217 @@ function getPriceImpact(actualAmount, idealAmount) {
   return parseFloat(impact.toString()) / 100; // Convert back to percentage
 }
 
+// ✅ ROBUST FALLBACK BALANCE FUNCTION
+async function getUserTokenBalanceRobust(connection, mintAddress, pubkey, attempt = 1, maxAttempts = 3) {
+  try {
+    logActivity('LIQUIDITY', `Robust balance check attempt ${attempt}/${maxAttempts}`, {
+      mint: mintAddress,
+      connection: connection === connection2 ? 'RPC2' : 'RPC1',
+      attempt
+    });
+
+    // Handle SOL balance
+    if (mintAddress === "So11111111111111111111111111111111111111112") {
+      const balance = await connection.getBalance(pubkey);
+      logSuccess('LIQUIDITY', `SOL balance retrieved via robust method`, {
+        balance: balance / 1e9 + ' SOL',
+        balanceRaw: balance
+      });
+      return new BN(balance);
+    }
+
+    // Try ATA first (fastest method)
+    const ata = getAssociatedTokenAddressSync(
+      new PublicKey(mintAddress),
+      pubkey,
+      false,
+      TOKEN_PROGRAM_ID
+    );
+
+    logActivity('LIQUIDITY', `Robust method: Trying ATA`, {
+      ata: ata.toBase58(),
+      mint: mintAddress
+    });
+
+    const acc = await getAccount(connection, ata);
+    const balance = new BN(acc.amount.toString());
+    
+    logSuccess('LIQUIDITY', `Robust method: ATA balance retrieved`, {
+      ata: ata.toBase58(),
+      balance: acc.amount.toString(),
+      attempt
+    });
+    
+    return balance;
+
+  } catch (err) {
+    logWarning('LIQUIDITY', `Robust method: ATA failed, trying comprehensive scan`, {
+      error: err.message,
+      mint: mintAddress,
+      attempt
+    });
+
+    try {
+      // ✅ COMPREHENSIVE FALLBACK - scan all token accounts
+      logActivity('LIQUIDITY', `Robust method: Scanning all token accounts`, {
+        mint: mintAddress,
+        owner: pubkey.toBase58()
+      });
+
+      const res = await connection.getTokenAccountsByOwner(pubkey, {
+        mint: new PublicKey(mintAddress),
+      });
+
+      let maxBalance = new BN(0);
+      let accountsFound = 0;
+
+      for (const acc of res.value) {
+        accountsFound++;
+        const parsed = acc.account.data?.parsed;
+        const balance = new BN(parsed?.info?.tokenAmount?.amount || 0);
+        const addr = acc.pubkey.toBase58();
+        
+        logActivity('LIQUIDITY', `Robust method: Found token account`, {
+          address: addr.slice(0, 8) + '...',
+          balance: balance.toString(),
+          mint: mintAddress.slice(0, 8) + '...'
+        });
+
+        if (balance.gt(maxBalance)) {
+          maxBalance = balance;
+        }
+      }
+
+      if (accountsFound > 0) {
+        logSuccess('LIQUIDITY', `Robust method: Comprehensive scan successful`, {
+          accountsFound,
+          maxBalance: maxBalance.toString(),
+          mint: mintAddress.slice(0, 8) + '...',
+          attempt
+        });
+        return maxBalance;
+      } else {
+        logWarning('LIQUIDITY', `Robust method: No token accounts found`, {
+          mint: mintAddress.slice(0, 8) + '...',
+          attempt
+        });
+        return new BN(0);
+      }
+
+    } catch (fallbackErr) {
+      logError('LIQUIDITY', `Robust method: All methods failed`, fallbackErr, {
+        mint: mintAddress.slice(0, 8) + '...',
+        attempt,
+        originalError: err.message.slice(0, 50) + '...'
+      });
+
+      // Retry if not max attempts
+      if (attempt < maxAttempts) {
+        logActivity('LIQUIDITY', `Robust method: Retrying in 2 seconds`, {
+          attempt: attempt + 1,
+          maxAttempts
+        });
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        return getUserTokenBalanceRobust(connection, mintAddress, pubkey, attempt + 1, maxAttempts);
+      }
+
+      // Final failure
+      return new BN(0);
+    }
+  }
+}
+
+// ✅ SEQUENTIAL FALLBACK BALANCE CHECK
+async function getTokenBalanceSequential(inputTokenAccount, inputTokenMetadata) {
+  const mintAddress = inputTokenMetadata.mint.toBase58();
+  
+  // ✅ STEP 1: Try normal method first (fastest)
+  logActivity('LIQUIDITY', `Step 1: Trying normal balance check for ${inputTokenMetadata.symbol}`, {
+    tokenAccount: inputTokenAccount.toBase58(),
+    mint: mintAddress.slice(0, 8) + '...'
+  });
+
+  try {
+    const balance = await connection2.getTokenAccountBalance(inputTokenAccount);
+    const balanceBN = new BN(balance.value.amount);
+    
+    logSuccess('LIQUIDITY', `Step 1: Normal method successful`, {
+      symbol: inputTokenMetadata.symbol,
+      balance: tokenAmountToHuman(balanceBN, inputTokenMetadata.decimals),
+      method: 'normal'
+    });
+    
+    return balanceBN;
+    
+  } catch (normalError) {
+    // ✅ Check if this is the specific "could not find account" error
+    const isAccountNotFoundError = normalError.message.includes('could not find account');
+    
+    logWarning('LIQUIDITY', `Step 1: Normal method failed`, {
+      error: normalError.message,
+      isTargetError: isAccountNotFoundError,
+      willTryRobust: isAccountNotFoundError
+    });
+
+    if (isAccountNotFoundError) {
+      // ✅ STEP 2: Try robust method with RPC2
+      logActivity('LIQUIDITY', `Step 2: Trying robust method with RPC2 for ${inputTokenMetadata.symbol}`, {
+        reason: 'Normal method returned "could not find account"'
+      });
+
+      try {
+        const balanceBN = await getUserTokenBalanceRobust(connection2, mintAddress, wallet.publicKey);
+        
+        if (!balanceBN.isZero()) {
+          logSuccess('LIQUIDITY', `Step 2: Robust RPC2 method successful`, {
+            symbol: inputTokenMetadata.symbol,
+            balance: tokenAmountToHuman(balanceBN, inputTokenMetadata.decimals),
+            method: 'robust_rpc2'
+          });
+          return balanceBN;
+        } else {
+          logWarning('LIQUIDITY', `Step 2: Robust RPC2 returned zero balance`);
+        }
+        
+      } catch (robustRpc2Error) {
+        logWarning('LIQUIDITY', `Step 2: Robust RPC2 method failed`, {
+          error: robustRpc2Error.message
+        });
+      }
+
+      // ✅ STEP 3: Try robust method with RPC1 (final fallback)
+      logActivity('LIQUIDITY', `Step 3: Trying robust method with RPC1 for ${inputTokenMetadata.symbol}`, {
+        reason: 'RPC2 robust method also failed'
+      });
+
+      try {
+        const balanceBN = await getUserTokenBalanceRobust(connection, mintAddress, wallet.publicKey);
+        
+        if (!balanceBN.isZero()) {
+          logSuccess('LIQUIDITY', `Step 3: Robust RPC1 method successful`, {
+            symbol: inputTokenMetadata.symbol,
+            balance: tokenAmountToHuman(balanceBN, inputTokenMetadata.decimals),
+            method: 'robust_rpc1'
+          });
+          return balanceBN;
+        } else {
+          logWarning('LIQUIDITY', `Step 3: Robust RPC1 returned zero balance`);
+        }
+        
+      } catch (robustRpc1Error) {
+        logError('LIQUIDITY', `Step 3: Final robust method failed`, robustRpc1Error);
+      }
+
+      // ✅ All robust methods failed
+      throw new Error(`All balance check methods failed for ${inputTokenMetadata.symbol}: ${normalError.message}`);
+      
+    } else {
+      // ✅ Different error - just re-throw
+      throw normalError;
+    }
+  }
+}
+
 // === OPTIMIZED addSingleSidedLiquidity dengan getUserPositionByPool ===
 async function addSingleSidedLiquidity(poolAddress) {
   const poolAddressStr = poolAddress.toString();
@@ -728,12 +1092,25 @@ async function addSingleSidedLiquidity(poolAddress) {
     let INPUT_AMOUNT;
     let actualInputAmountHuman;
 
-    // ✅ BALANCE CHECK - now inside retry wrapper
-    const balance = await connection2.getTokenAccountBalance(inputTokenAccount);
-    const balanceBN = new BN(balance.value.amount);
+    // ✅ NEW - Sequential fallback
+    logActivity('LIQUIDITY', `Starting sequential balance check for ${inputTokenMetadata.symbol}`);
+
+    let balanceBN;
+    try {
+      balanceBN = await getTokenBalanceSequential(inputTokenAccount, inputTokenMetadata);
+    } catch (balanceError) {
+      logError('LIQUIDITY', `Sequential balance check completely failed`, balanceError, {
+        tokenAccount: inputTokenAccount.toBase58(),
+        mint: inputTokenMetadata.mint.toBase58(),
+        suggestion: 'Token account may need more settlement time or does not exist'
+      });
+      
+      throw new Error(`Token balance unavailable after all methods: ${balanceError.message}`);
+    }
+
     const balanceHuman = tokenAmountToHuman(balanceBN, inputTokenMetadata.decimals);
 
-    logActivity('LIQUIDITY', `${inputTokenMetadata.symbol} balance check`, {
+    logActivity('LIQUIDITY', `${inputTokenMetadata.symbol} sequential balance check completed`, {
       symbol: inputTokenMetadata.symbol,
       balance: balanceHuman,
       balanceRaw: balanceBN.toString()
@@ -1003,30 +1380,27 @@ function filterPools(pools) {
   return pools.filter(pool => {
     const meetsFeeCriteria = pool.fee > 3;
     const meetsCollectMode = pool.collectMode === 1;
-    
+
     const endsWithBonk = typeof pool.mint === 'string' && /bonk$/.test(pool.mint);
     const endsWithBAGS = typeof pool.mint === 'string' && /BAGS$/.test(pool.mint);
     const meetsDexCriteria = !endsWithBonk && !endsWithBAGS && pool.dex !== "letsbonk.fun";
 
     const meetsPumpfunCriteria = (() => {
-      if (pool.dex === "pumpfun-amm" && pool.mint) {
-        return /pump$/.test(pool.mint);
+      if (pool.dex === "pumpfun-amm") {
+        return /pump$/.test(pool.mint) || pool.launchpad === "pump.fun";
       }
       return true;
     })();
 
-    // Tambahan logika untuk first_pool pumpfun-amm
-    const meetsFirstPoolCriteria = (() => {
-      if (pool.dex === "pumpfun-amm" && pool.first_pool) {
-        // Skip jika first_pool TIDAK berakhiran "pump"
-        return /pump$/.test(pool.first_pool);
-      }
-      return true; // Untuk dex lain, lolos filter
-    })();
-
-    return meetsFeeCriteria && meetsCollectMode && meetsDexCriteria && meetsPumpfunCriteria && meetsFirstPoolCriteria;
+    return (
+      meetsFeeCriteria &&
+      meetsCollectMode &&
+      meetsDexCriteria &&
+      meetsPumpfunCriteria
+    );
   });
 }
+
 
 // === QUEUE MANAGEMENT ===
 function addToQueue(pools) {

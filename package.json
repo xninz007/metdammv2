@@ -1,7 +1,7 @@
 {
   "name": "metdammv2-bot",
   "version": "1.0.0",
-  "description": "metdammv2 bit",
+  "description": "metdammv2 bot",
   "type": "module",
   "main": "index.js",
   "scripts": {

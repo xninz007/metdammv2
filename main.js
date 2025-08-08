@@ -53,9 +53,10 @@ const DEX_SWAP_AMOUNTS = {
   // DEX names dan swap amount dalam SOL
   "pumpfun-amm": 0.05,
   "raydium-clmm": 0.04,
-  "raydium-cp-swaps": 0.03,
+  "raydium-cp-swaps": 0.04,
   "jup-studio": 0.01,
   "meteora-damm-v2": 0.03,
+  "wavebreak": 0.04,
   "pumpfun": 0.01,
   "moonit-cp": 0.01,
   "moonshot": 0.01,
@@ -113,8 +114,8 @@ function derivePositionNftAccount(positionNftMint) {
   )[0];
 }
 
-// === FUNGSI UNTUK MENDAPATKAN SWAP AMOUNT BERDASARKAN DEX ===
-function getSwapAmountForDex(dexName) {
+// === SIMPLE ENHANCEMENT di getSwapAmountForDex ===
+function getSwapAmountForDex(dexName, poolData = null) {
   if (!dexName || typeof dexName !== 'string') {
     logWarning('DEX_CONFIG', 'Invalid DEX name provided, using default amount', {
       providedDex: dexName,
@@ -129,6 +130,30 @@ function getSwapAmountForDex(dexName) {
 
   // Normalize DEX name (lowercase, trim spaces)
   const normalizedDex = dexName.toLowerCase().trim();
+  
+  // ✅ SIMPLE PUMPFUN LOGIC
+  if (normalizedDex === "pumpfun-amm" && poolData) {
+    const endsWithPump = poolData.mint && /pump$/.test(poolData.mint);
+    const isFromPumpFun = poolData.launchpad === "pump.fun";
+    
+    if (endsWithPump || isFromPumpFun) {
+      // ✅ MEMENUHI CRITERIA - USE 0.05 SOL
+      console.log(`🎯 PUMPFUN PREMIUM: ${poolData.symbol || poolData.mint?.slice(0,8)} → 0.05 SOL (criteria met)`);
+      return {
+        amountSOL: DEX_SWAP_AMOUNTS["pumpfun-amm"], // 0.05
+        amountLamports: DEX_SWAP_AMOUNTS["pumpfun-amm"] * 1e9,
+        source: 'pumpfun_premium'
+      };
+    } else {
+      // ❌ TIDAK MEMENUHI CRITERIA - USE 0.01 SOL  
+      console.log(`⚠️  PUMPFUN DEFAULT: ${poolData.symbol || poolData.mint?.slice(0,8)} → 0.01 SOL (criteria not met, saved 0.04 SOL)`);
+      return {
+        amountSOL: DEX_SWAP_AMOUNTS.default, // 0.01
+        amountLamports: DEX_SWAP_AMOUNTS.default * 1e9,
+        source: 'pumpfun_default'
+      };
+    }
+  }
   
   // Check if we have a specific configuration for this DEX
   const swapAmountSOL = DEX_SWAP_AMOUNTS[normalizedDex] || DEX_SWAP_AMOUNTS.default;
@@ -678,7 +703,7 @@ async function autoSwap({ inputMint, outputMint, poolData, signer }) {
   const poolSymbol = poolData?.symbol || symbol_global.get(outputMint) || outputMint.slice(0, 8) + '...';
   
   // Get DEX-specific swap amount
-  const swapConfig = getSwapAmountForDex(dexName);
+  const swapConfig = getSwapAmountForDex(dexName, poolData);
 
   if (!signer || !signer.publicKey) {
     const error = new Error("Parameter 'signer' (Keypair) harus disediakan");
@@ -1380,14 +1405,28 @@ function filterPools(pools) {
   return pools.filter(pool => {
     const meetsFeeCriteria = pool.fee > 3;
     const meetsCollectMode = pool.collectMode === 1;
+    const meetsschedulerMode = pool.schedulerMode === 0; 
 
     const endsWithBonk = typeof pool.mint === 'string' && /bonk$/.test(pool.mint);
     const endsWithBAGS = typeof pool.mint === 'string' && /BAGS$/.test(pool.mint);
     const meetsDexCriteria = !endsWithBonk && !endsWithBAGS && pool.dex !== "letsbonk.fun";
+    const meetsMcapCriteria = (() => {
+      const isWavebreakDex = pool.dex === 'wavebreak';
+      const endsWithWave = typeof pool.mint === 'string' && /wave$/.test(pool.mint);
+      
+      // Jika wavebreak atau mint diakhiri dengan "wave", mcap tidak dicek (anggap lolos)
+      if (isWavebreakDex || endsWithWave) return true;
 
+      // Normal check
+      return typeof pool.marketcap === 'number' && pool.marketcap >= 25000;
+    })();
+
+    // ✅ SIMPLE FIX: ALLOW SEMUA PUMPFUN-AMM
     const meetsPumpfunCriteria = (() => {
       if (pool.dex === "pumpfun-amm") {
-        return /pump$/.test(pool.mint) || pool.launchpad === "pump.fun";
+        // ✅ ALWAYS RETURN TRUE - semua pumpfun-amm pools diterima
+        // Logic khusus amount akan ditangani di getSwapAmountForDex
+        return true;
       }
       return true;
     })();
@@ -1396,6 +1435,8 @@ function filterPools(pools) {
       meetsFeeCriteria &&
       meetsCollectMode &&
       meetsDexCriteria &&
+      meetsMcapCriteria &&
+      meetsschedulerMode &&
       meetsPumpfunCriteria
     );
   });
@@ -1518,7 +1559,7 @@ async function processPoolQueue() {
 
     // Step 1: AutoSwap
     const dexName = currentPool.dex || 'unknown';
-    const swapConfig = getSwapAmountForDex(dexName);
+    const swapConfig = getSwapAmountForDex(dexName, currentPool);
 
     logPoolProcessing('SWAP_START', currentPool.symbol, poolAddress, 'STARTING_DEX_SPECIFIC_SWAP', {
       dex: dexName,

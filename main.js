@@ -40,7 +40,7 @@ import { VersionedTransaction } from "@solana/web3.js";
 // === KONFIGURASI ===
 const RPC_URL = "";
 const RPC_URL_2 = "";
-const PRIVATE_KEY_BS58 = ""; // 🛑 KOSONGKAN UNTUK KEAMANAN - ISI SAAT RUNNING
+const PRIVATE_KEY_BS58 = "";; // 🛑 KOSONGKAN UNTUK KEAMANAN - ISI SAAT RUNNING
 const SENT_POOLS_FILE = "./sent_pools.json";
 
 // === KONFIGURASI MONITORING ===
@@ -56,7 +56,7 @@ const DEX_SWAP_AMOUNTS = {
   "raydium-cp-swaps": 0.04,
   "jup-studio": 0.01,
   "meteora-damm-v2": 0.03,
-  "wavebreak": 0.04,
+  "wavebreak": 0.02,
   "pumpfun": 0.01,
   "moonit-cp": 0.01,
   "moonshot": 0.01,
@@ -133,27 +133,26 @@ function getSwapAmountForDex(dexName, poolData = null) {
   
   // ✅ SIMPLE PUMPFUN LOGIC
   if (normalizedDex === "pumpfun-amm" && poolData) {
-    const endsWithPump = poolData.mint && /pump$/.test(poolData.mint);
-    const isFromPumpFun = poolData.launchpad === "pump.fun";
+    const isFromPumpFun = poolData.launch === "pump.fun";
     
-    if (endsWithPump || isFromPumpFun) {
-      // ✅ MEMENUHI CRITERIA - USE 0.05 SOL
-      console.log(`🎯 PUMPFUN PREMIUM: ${poolData.symbol || poolData.mint?.slice(0,8)} → 0.05 SOL (criteria met)`);
+    if (isFromPumpFun) {
+      // ✅ DARI PUMP.FUN - OTOMATIS PREMIUM
+      console.log(`🎯 PUMPFUN PREMIUM: ${poolData.symbol || poolData.mint?.slice(0,8)} → 0.05 SOL (from pump.fun)`);
       return {
         amountSOL: DEX_SWAP_AMOUNTS["pumpfun-amm"], // 0.05
         amountLamports: DEX_SWAP_AMOUNTS["pumpfun-amm"] * 1e9,
         source: 'pumpfun_premium'
       };
     } else {
-      // ❌ TIDAK MEMENUHI CRITERIA - USE 0.01 SOL  
-      console.log(`⚠️  PUMPFUN DEFAULT: ${poolData.symbol || poolData.mint?.slice(0,8)} → 0.01 SOL (criteria not met, saved 0.04 SOL)`);
+      // ❌ BUKAN DARI PUMP.FUN - DEFAULT
+      console.log(`⚠️  PUMPFUN DEFAULT: ${poolData.symbol || poolData.mint?.slice(0,8)} → 0.03 SOL (not from pump.fun)`);
       return {
-        amountSOL: DEX_SWAP_AMOUNTS.default, // 0.01
-        amountLamports: DEX_SWAP_AMOUNTS.default * 1e9,
+        amountSOL: 0.03, // 0.01
+        amountLamports: 0.03 * 1e9,
         source: 'pumpfun_default'
       };
     }
-  }
+}
   
   // Check if we have a specific configuration for this DEX
   const swapAmountSOL = DEX_SWAP_AMOUNTS[normalizedDex] || DEX_SWAP_AMOUNTS.default;
@@ -696,6 +695,77 @@ async function swapBackToSOL(tokenMint, poolSymbol) {
     return null;
   }
 }
+
+// === SCHEDULER CHECKER INTEGRATION ===
+// Add this after the existing utility functions (around line 500)
+
+async function checkPoolScheduler(poolAddress) {
+  try {
+    logActivity('SCHEDULER', `Checking pool scheduler: ${poolAddress.slice(0, 8)}...`);
+    
+    const poolState = await cpAmm2.fetchPoolState(new PublicKey(poolAddress));
+    const baseFee = poolState.poolFees?.baseFee;
+    
+    if (!baseFee) {
+      logWarning('SCHEDULER', `No fee structure found for pool`, {
+        poolAddress: poolAddress.slice(0, 8) + '...'
+      });
+      return { hasScheduler: false, type: 'UNKNOWN' };
+    }
+    
+    // Check if has active scheduler
+    const hasActiveScheduler = (
+      baseFee.numberOfPeriod > 0 &&
+      baseFee.reductionFactor.toNumber() > 0 &&
+      baseFee.periodFrequency.toNumber() > 0
+    );
+    
+    if (hasActiveScheduler) {
+      const schedulerType = baseFee.feeSchedulerMode === 0 ? 'LINEAR' : 'EXPONENTIAL';
+      
+      const schedulerInfo = {
+        hasScheduler: true,
+        type: schedulerType,
+        mode: baseFee.feeSchedulerMode,
+        initialFee: baseFee.cliffFeeNumerator.toNumber() / 10000,
+        periods: baseFee.numberOfPeriod,
+        frequency: baseFee.periodFrequency.toNumber(),
+        reduction: baseFee.reductionFactor.toNumber() / 10000
+      };
+      
+      logSuccess('SCHEDULER', `${schedulerType} scheduler detected`, {
+        poolAddress: poolAddress.slice(0, 8) + '...',
+        mode: baseFee.feeSchedulerMode,
+        initialFee: schedulerInfo.initialFee + '%',
+        periods: schedulerInfo.periods,
+        frequencyHours: schedulerInfo.frequency / 3600,
+        reductionPerPeriod: schedulerInfo.reduction + '%'
+      });
+      
+      return schedulerInfo;
+    } else {
+      const basicPoolInfo = {
+        hasScheduler: false,
+        type: 'BASIC',
+        staticFee: baseFee.cliffFeeNumerator.toNumber() / 10000
+      };
+      
+      logActivity('SCHEDULER', `Basic pool detected (no scheduler)`, {
+        poolAddress: poolAddress.slice(0, 8) + '...',
+        staticFee: basicPoolInfo.staticFee + '%'
+      });
+      
+      return basicPoolInfo;
+    }
+    
+  } catch (error) {
+    logError('SCHEDULER', `Error checking pool scheduler`, error, {
+      poolAddress: poolAddress.slice(0, 8) + '...'
+    });
+    return { hasScheduler: false, type: 'ERROR', error: error.message };
+  }
+}
+
 
 async function autoSwap({ inputMint, outputMint, poolData, signer }) {
   // Extract DEX info from poolData (NEW: poolData parameter instead of amountInLamports)
@@ -1400,48 +1470,64 @@ async function addSingleSidedLiquidity(poolAddress) {
   }
 }
 
-// === POOL FUNCTIONS ===
-function filterPools(pools) {
-  return pools.filter(pool => {
-    const meetsFeeCriteria = pool.fee > 3;
-    const meetsCollectMode = pool.collectMode === 1;
-    const meetsschedulerMode = pool.schedulerMode === 0; 
-
-    const endsWithBonk = typeof pool.mint === 'string' && /bonk$/.test(pool.mint);
-    const endsWithBAGS = typeof pool.mint === 'string' && /BAGS$/.test(pool.mint);
-    const meetsDexCriteria = !endsWithBonk && !endsWithBAGS && pool.dex !== "letsbonk.fun";
-    const meetsMcapCriteria = (() => {
-      const isWavebreakDex = pool.dex === 'wavebreak';
-      const endsWithWave = typeof pool.mint === 'string' && /wave$/.test(pool.mint);
-      
-      // Jika wavebreak atau mint diakhiri dengan "wave", mcap tidak dicek (anggap lolos)
-      if (isWavebreakDex || endsWithWave) return true;
-
-      // Normal check
-      return typeof pool.marketcap === 'number' && pool.marketcap >= 25000;
-    })();
-
-    // ✅ SIMPLE FIX: ALLOW SEMUA PUMPFUN-AMM
-    const meetsPumpfunCriteria = (() => {
-      if (pool.dex === "pumpfun-amm") {
-        // ✅ ALWAYS RETURN TRUE - semua pumpfun-amm pools diterima
-        // Logic khusus amount akan ditangani di getSwapAmountForDex
-        return true;
-      }
-      return true;
-    })();
-
-    return (
-      meetsFeeCriteria &&
-      meetsCollectMode &&
-      meetsDexCriteria &&
-      meetsMcapCriteria &&
-      meetsschedulerMode &&
-      meetsPumpfunCriteria
-    );
+// === UPDATED filterPoolsWithScheduler FUNCTION ===
+// 1. ✅ KEMBALIKAN filterPoolsWithScheduler menjadi filterPoolsBasic (tanpa scheduler check)
+async function filterPoolsBasic(pools) {
+  const filteredPools = [];
+  const skippedPools = [];
+  
+  logActivity('FILTER', `Basic pool filtering (no scheduler check)`, {
+    totalPools: pools.length
   });
-}
+  
+  for (const pool of pools) {
+    try {
+      const meetsFeeCriteria = pool.fee > 3 && pool.fee <= 10; // ✅ Max 6%
+      const meetsCollectMode = pool.collectMode === 1;
+      const meetsSchedulerMode = pool.schedulerMode === 0; // LINEAR only
+      
+      const endsWithBonk = typeof pool.mint === 'string' && /bonk$/.test(pool.mint);
+      const endsWithBAGS = typeof pool.mint === 'string' && /BAGS$/.test(pool.mint);
+      const meetsDexCriteria = !endsWithBonk && !endsWithBAGS && pool.dex !== "letsbonk.fun";
+      
+      const meetsMcapCriteria = (() => {
+        const isWavebreakDex = pool.dex === 'wavebreak';
+        const endsWithWave = typeof pool.mint === 'string' && /wave$/.test(pool.mint);
+        
+        if (isWavebreakDex || endsWithWave) return true;
+        return typeof pool.marketcap === 'number' && pool.marketcap >= 25000;
+      })();
 
+      const meetsPumpfunCriteria = pool.dex === "pumpfun-amm" ? true : true;
+      
+      const passesBasicCriteria = (
+        meetsFeeCriteria &&
+        meetsCollectMode &&
+        meetsDexCriteria &&
+        meetsMcapCriteria &&
+        meetsPumpfunCriteria &&
+        meetsSchedulerMode
+      );
+      
+      if (passesBasicCriteria) {
+        filteredPools.push(pool);
+      } else {
+        skippedPools.push({...pool, skipReason: 'BASIC_CRITERIA'});
+      }
+      
+    } catch (error) {
+      skippedPools.push({...pool, skipReason: 'ERROR'});
+    }
+  }
+  
+  logActivity('FILTER', `Basic filtering completed`, {
+    total: pools.length,
+    passed: filteredPools.length,
+    skipped: skippedPools.length
+  });
+  
+  return filteredPools;
+}
 
 // === QUEUE MANAGEMENT ===
 function addToQueue(pools) {
@@ -1469,7 +1555,7 @@ function addToQueue(pools) {
 }
 
 // === POOL QUEUE PROCESSING ===
-async function processPoolQueue() {
+async function processPoolQueueEnhanced() {
   if (isProcessingPool || poolQueue.length === 0) {
     return;
   }
@@ -1478,34 +1564,50 @@ async function processPoolQueue() {
   const currentPool = poolQueue.shift();
   const poolAddress = currentPool.pool_address;
 
-  // ✅ Generate mint-based symbol if null
+  // Generate mint-based symbol if null
   let poolSymbol = currentPool.symbol;
   if (!poolSymbol || poolSymbol === 'null') {
     poolSymbol = `TOKEN_${currentPool.mint?.slice(0, 8)}`;
-    console.log(`🔧 Generated symbol: ${poolSymbol} for mint ${currentPool.mint}`);
-    
-    // Update the pool object dan symbol_global
     currentPool.symbol = poolSymbol;
     if (currentPool.mint) {
       symbol_global.set(currentPool.mint, poolSymbol);
     }
   }
 
+  // Enhanced logging with scheduler info
+  const schedulerInfo = currentPool.schedulerInfo || {};
+  const schedulerType = schedulerInfo.type || 'UNKNOWN';
+  const initialFee = schedulerInfo.initialFee || 0;
+  
   logPoolProcessing('QUEUE_START', poolSymbol, poolAddress, 'PROCESSING', {
     queueRemaining: poolQueue.length,
     mint: currentPool.mint,
     dex: currentPool.dex,
+    schedulerType: schedulerType,
+    initialFee: initialFee + '%',
+    periods: schedulerInfo.periods || 0,
     symbolGenerated: !currentPool.symbol || currentPool.symbol === 'null'
   });
+
+  console.log(`\n🎯 === PROCESSING SCHEDULER POOL: ${poolSymbol} ===`);
+  console.log(`📊 Scheduler Type: ${schedulerType}`);
+  console.log(`💰 Initial Fee: ${initialFee}%`);
+  if (schedulerInfo.periods) {
+    console.log(`⏰ Periods: ${schedulerInfo.periods}`);
+    console.log(`📉 Reduction per period: ${schedulerInfo.reduction || 0}%`);
+    console.log(`⏱️ Frequency: ${(schedulerInfo.frequency || 0) / 3600} hours`);
+  }
 
   try {
     const currentState = poolProcessingState.get(poolAddress);
     const retryCount = poolRetryCount.get(poolAddress) || 0;
 
-    logActivity('POOL', `Pool state check: ${currentPool.symbol}`, {
+    logActivity('POOL', `Scheduler pool state check: ${currentPool.symbol}`, {
       state: currentState || "new",
       retryCount,
-      maxRetries: MAX_POOL_RETRIES
+      maxRetries: MAX_POOL_RETRIES,
+      schedulerType,
+      initialFee: initialFee + '%'
     });
 
     if (currentState === "completed") {
@@ -1539,7 +1641,8 @@ async function processPoolQueue() {
 
     if (currentState === "swapped") {
       logPoolProcessing('RETRY_LIQUIDITY', currentPool.symbol, poolAddress, 'LIQUIDITY_RETRY', {
-        retryCount
+        retryCount,
+        schedulerType
       });
 
       const liquidityResult = await addSingleSidedLiquidity(poolAddress);
@@ -1551,7 +1654,9 @@ async function processPoolQueue() {
       logPoolProcessing('COMPLETE', currentPool.symbol, poolAddress, 'LIQUIDITY_RETRY_SUCCESS', {
         signature: liquidityResult.signature,
         positionNft: liquidityResult.positionNft,
-        totalPositions: positionCount
+        totalPositions: positionCount,
+        schedulerType,
+        initialFee: initialFee + '%'
       });
 
       return;
@@ -1561,29 +1666,38 @@ async function processPoolQueue() {
     const dexName = currentPool.dex || 'unknown';
     const swapConfig = getSwapAmountForDex(dexName, currentPool);
 
-    logPoolProcessing('SWAP_START', currentPool.symbol, poolAddress, 'STARTING_DEX_SPECIFIC_SWAP', {
+    logPoolProcessing('SWAP_START', currentPool.symbol, poolAddress, 'STARTING_SCHEDULER_POOL_SWAP', {
       dex: dexName,
       swapAmount: swapConfig.amountSOL + ' SOL',
-      configSource: swapConfig.source
+      configSource: swapConfig.source,
+      schedulerType,
+      initialFee: initialFee + '%'
     });
 
     const swapSignature = await autoSwap({
       inputMint: SOL_MINT,
       outputMint: currentPool.mint,
-      poolData: currentPool, // Pass entire pool data
+      poolData: currentPool,
       signer: wallet,
     });
 
     poolProcessingState.set(poolAddress, "swapped");
-    logPoolProcessing('SWAP_COMPLETE', currentPool.symbol, poolAddress, 'SWAP_SUCCESS', {
-      signature: swapSignature
+    logPoolProcessing('SWAP_COMPLETE', currentPool.symbol, poolAddress, 'SCHEDULER_POOL_SWAP_SUCCESS', {
+      signature: swapSignature,
+      schedulerType
     });
 
-    logActivity('POOL', `Waiting for swap to settle: ${currentPool.symbol}`, { settleTime: 3000 });
+    logActivity('POOL', `Waiting for scheduler pool swap to settle: ${currentPool.symbol}`, { 
+      settleTime: 3000,
+      schedulerType 
+    });
     await new Promise(resolve => setTimeout(resolve, 3000));
 
     // Step 2: Add Liquidity
-    logPoolProcessing('LIQUIDITY_START', currentPool.symbol, poolAddress, 'STARTING_LIQUIDITY');
+    logPoolProcessing('LIQUIDITY_START', currentPool.symbol, poolAddress, 'STARTING_SCHEDULER_POOL_LIQUIDITY', {
+      schedulerType,
+      initialFee: initialFee + '%'
+    });
 
     const liquidityResult = await addSingleSidedLiquidity(poolAddress);
 
@@ -1591,12 +1705,20 @@ async function processPoolQueue() {
     poolRetryCount.delete(poolAddress);
     positionCount++;
 
-    logPoolProcessing('COMPLETE', currentPool.symbol, poolAddress, 'FULL_SUCCESS', {
+    logPoolProcessing('COMPLETE', currentPool.symbol, poolAddress, 'SCHEDULER_POOL_FULL_SUCCESS', {
       swapSignature,
       liquiditySignature: liquidityResult.signature,
       positionNft: liquidityResult.positionNft,
-      totalPositions: positionCount
+      totalPositions: positionCount,
+      schedulerType,
+      initialFee: initialFee + '%',
+      periods: schedulerInfo.periods || 0
     });
+
+    console.log(`\n✅ === SCHEDULER POOL COMPLETED: ${poolSymbol} ===`);
+    console.log(`🎯 Type: ${schedulerType}`);
+    console.log(`💰 Started with: ${initialFee}% fee`);
+    console.log(`📈 Position NFT: ${liquidityResult.positionNft.slice(0, 8)}...`);
 
   } catch (error) {
     const currentState = poolProcessingState.get(poolAddress);
@@ -1605,17 +1727,20 @@ async function processPoolQueue() {
 
     poolRetryCount.set(poolAddress, newRetryCount);
 
-    logError('POOL', `Pool processing failed: ${currentPool.symbol}`, error, {
+    logError('POOL', `Scheduler pool processing failed: ${currentPool.symbol}`, error, {
       poolAddress,
       currentState,
       newRetryCount,
-      maxRetries: MAX_POOL_RETRIES
+      maxRetries: MAX_POOL_RETRIES,
+      schedulerType,
+      initialFee: initialFee + '%'
     });
 
     if (newRetryCount >= MAX_POOL_RETRIES) {
       if (currentState === "swapped") {
         logPoolProcessing('RECOVERY_START', currentPool.symbol, poolAddress, 'STARTING_RECOVERY', {
-          reason: 'LIQUIDITY_FAILED_MAX_RETRIES'
+          reason: 'LIQUIDITY_FAILED_MAX_RETRIES',
+          schedulerType
         });
 
         const recoverySignature = await swapBackToSOL(currentPool.mint, currentPool.symbol);
@@ -1623,52 +1748,59 @@ async function processPoolQueue() {
         if (recoverySignature) {
           poolProcessingState.set(poolAddress, "failed_recovered");
           logPoolProcessing('RECOVERY_SUCCESS', currentPool.symbol, poolAddress, 'TOKENS_RECOVERED', {
-            recoverySignature
+            recoverySignature,
+            schedulerType
           });
         } else {
           poolProcessingState.set(poolAddress, "failed_stuck");
           logPoolProcessing('RECOVERY_FAILED', currentPool.symbol, poolAddress, 'TOKENS_STUCK', {
-            warning: 'Manual intervention needed'
+            warning: 'Manual intervention needed',
+            schedulerType
           });
         }
       } else {
         poolProcessingState.set(poolAddress, "failed");
         logPoolProcessing('FAIL', currentPool.symbol, poolAddress, 'SWAP_FAILED_MAX_RETRIES', {
           newRetryCount,
-          maxRetries: MAX_POOL_RETRIES
+          maxRetries: MAX_POOL_RETRIES,
+          schedulerType
         });
       }
     } else {
       if (currentState === "swapped") {
         logPoolProcessing('RETRY_QUEUE', currentPool.symbol, poolAddress, 'LIQUIDITY_RETRY_QUEUED', {
           attempt: newRetryCount,
-          maxRetries: MAX_POOL_RETRIES
+          maxRetries: MAX_POOL_RETRIES,
+          schedulerType
         });
         poolQueue.unshift(currentPool);
       } else {
         poolProcessingState.set(poolAddress, "pending");
         logPoolProcessing('RETRY_QUEUE', currentPool.symbol, poolAddress, 'FULL_RETRY_QUEUED', {
           attempt: newRetryCount,
-          maxRetries: MAX_POOL_RETRIES
+          maxRetries: MAX_POOL_RETRIES,
+          schedulerType
         });
         poolQueue.unshift(currentPool);
       }
     }
+
   } finally {
     isProcessingPool = false;
 
     if (poolQueue.length > 0) {
-      logActivity('POOL', `Continuing queue processing`, {
+      logActivity('POOL', `Continuing scheduler pool queue processing`, {
         remainingPools: poolQueue.length,
         nextPool: poolQueue[0]?.symbol,
+        nextSchedulerType: poolQueue[0]?.schedulerInfo?.type || 'UNKNOWN',
         delay: 3000
       });
 
       setTimeout(() => {
-        processPoolQueue();
+        processPoolQueueEnhanced();
       }, 3000);
     } else {
-      logSuccess('POOL', 'Queue processing completed - no more pools to process', {
+      logSuccess('POOL', 'Scheduler pool queue processing completed', {
         totalProcessed: positionCount,
         completedPools: Array.from(poolProcessingState.values()).filter(state => state === "completed").length
       });
@@ -1895,7 +2027,7 @@ function hasFileChanged() {
   }
 }
 
-async function checkAndProcessPools() {
+async function checkAndProcessPoolsEnhanced() {
   try {
     if (!hasFileChanged()) {
       return;
@@ -1906,13 +2038,16 @@ async function checkAndProcessPools() {
       return;
     }
 
-    console.log(`\n🔄 === POOL CHECK [${getCurrentTimestamp()}] ===`);
+    console.log(`\n🔄 === ENHANCED POOL CHECK [${getCurrentTimestamp()}] ===`);
     console.log("📄 File updated, checking for new pools...");
 
     poolsData = JSON.parse(fs.readFileSync(SENT_POOLS_FILE, 'utf8'));
     updateSymbolGlobal();
-    const eligiblePools = filterPools(poolsData);
+    
+    // ✅ STEP 1: Basic filtering (fast) - semua pools
+    const eligiblePools = await filterPoolsBasic(poolsData);
 
+    // ✅ STEP 2: Find truly NEW pools (belum di snapshot)
     const trulyNewPools = eligiblePools.filter(pool => {
       const isNotInSnapshot = !initialPoolSnapshot.has(pool.pool_address);
       const poolState = poolProcessingState.get(pool.pool_address);
@@ -1923,63 +2058,125 @@ async function checkAndProcessPools() {
     });
 
     console.log(`📋 Total pools in file: ${poolsData.length}`);
-    console.log(`🎯 Eligible pools: ${eligiblePools.length}`);
-    console.log(`📸 Initial snapshot: ${initialPoolSnapshot.size} pools`);
+    console.log(`🎯 Eligible pools (basic criteria): ${eligiblePools.length}`);
     console.log(`🆕 Truly new pools: ${trulyNewPools.length}`);
-    console.log(`📋 Queue: ${poolQueue.length} waiting`);
-    console.log(`✅ Completed pools: ${Array.from(poolProcessingState.values()).filter(state => state === "completed").length}`);
-    console.log(`🔄 Swapped pools: ${Array.from(poolProcessingState.values()).filter(state => state === "swapped").length}`);
-    console.log(`❌ Failed pools: ${Array.from(poolProcessingState.values()).filter(state => state === "failed").length}`);
-    console.log(`🔄 Recovered pools: ${Array.from(poolProcessingState.values()).filter(state => state === "failed_recovered").length}`);
-    console.log(`⚠️ Stuck pools: ${Array.from(poolProcessingState.values()).filter(state => state === "failed_stuck").length}`);
 
     if (trulyNewPools.length === 0) {
-      console.log("ℹ️ No truly new pools to add to queue (skipping initial snapshot)");
+      console.log("ℹ️ No truly new pools to check for schedulers");
       return;
     }
 
-    console.log(`🆕 New pools detected:`);
-    trulyNewPools.forEach((pool, i) => {
-      console.log(`  ${i + 1}. ${pool.symbol} (${pool.pool_address.slice(0, 8)}...) - ${pool.dex}`);
+    // ✅ STEP 3: Scheduler check HANYA untuk truly new pools
+    console.log(`\n🔍 === SCHEDULER VERIFICATION (${trulyNewPools.length} new pools) ===`);
+    
+    const poolsWithActiveScheduler = [];
+    const poolsWithoutScheduler = [];
+
+    for (const pool of trulyNewPools) {
+      try {
+        logActivity('SCHEDULER', `Checking new pool: ${pool.symbol}`, {
+          poolAddress: pool.pool_address.slice(0, 8) + '...',
+          dex: pool.dex,
+          fee: pool.fee + '%'
+        });
+
+        // ✅ SCHEDULER CHECK hanya untuk pools baru
+        const schedulerInfo = await checkPoolScheduler(pool.pool_address);
+        
+        if (schedulerInfo.hasScheduler && schedulerInfo.type === 'LINEAR') {
+          // ✅ Pool baru dengan active scheduler
+          const enhancedPool = {
+            ...pool,
+            schedulerInfo: schedulerInfo
+          };
+          
+          poolsWithActiveScheduler.push(enhancedPool);
+          
+          logSuccess('SCHEDULER', `✅ New pool with ACTIVE scheduler: ${pool.symbol}`, {
+            poolAddress: pool.pool_address.slice(0, 8) + '...',
+            initialFee: schedulerInfo.initialFee + '%',
+            periods: schedulerInfo.periods
+          });
+          
+        } else {
+          // ❌ Pool baru tapi tidak ada active scheduler
+          poolsWithoutScheduler.push(pool);
+          
+          logWarning('SCHEDULER', `❌ New pool without active scheduler: ${pool.symbol}`, {
+            poolAddress: pool.pool_address.slice(0, 8) + '...',
+            hasScheduler: schedulerInfo.hasScheduler,
+            schedulerType: schedulerInfo.type || 'NONE'
+          });
+        }
+        
+        // Delay untuk avoid RPC rate limit
+        await new Promise(resolve => setTimeout(resolve, 100));
+        
+      } catch (error) {
+        poolsWithoutScheduler.push(pool);
+        logError('SCHEDULER', `Error checking scheduler for ${pool.symbol}`, error);
+      }
+    }
+
+    // ✅ SUMMARY
+    console.log(`\n📊 === SCHEDULER CHECK RESULTS ===`);
+    console.log(`✅ New pools with active scheduler: ${poolsWithActiveScheduler.length}`);
+    console.log(`❌ New pools without scheduler: ${poolsWithoutScheduler.length}`);
+
+    if (poolsWithActiveScheduler.length === 0) {
+      console.log("ℹ️ No new pools with active schedulers to process");
+      return;
+    }
+
+    // ✅ STEP 4: Add only pools with active scheduler to queue
+    console.log(`\n🆕 New pools with active schedulers:`);
+    poolsWithActiveScheduler.forEach((pool, i) => {
+      const schedulerType = pool.schedulerInfo?.type || 'UNKNOWN';
+      const initialFee = pool.schedulerInfo?.initialFee || 0;
+      console.log(`  ${i + 1}. ${pool.symbol} (${pool.pool_address.slice(0, 8)}...) - ${pool.dex} [${schedulerType} - ${initialFee}%]`);
     });
 
-    addToQueue(trulyNewPools);
+    addToQueue(poolsWithActiveScheduler);
 
     if (!isProcessingPool && poolQueue.length > 0) {
-      console.log(`🚀 Starting queue processing...`);
-      processPoolQueue();
+      console.log(`🚀 Starting queue processing for new scheduler-enabled pools...`);
+      processPoolQueueEnhanced();
     }
 
   } catch (error) {
-    console.error("❌ Error checking pools:", error.message);
+    console.error("❌ Error in enhanced pool checking:", error.message);
+    logError('SYSTEM', 'Enhanced pool checking failed', error);
   }
 }
 
-// === FIXED startDaemon() FUNCTION ===
+
+// 2. ✅ FIX startDaemon() function - ganti interval call
 async function startDaemon() {
   startLogMonitoring();
 
   logActivity('SYSTEM', 'Pool Orchestrator Daemon Starting', {
-    version: 'Enhanced with DEX-Specific Amounts + Comprehensive Logging',
+    version: 'Enhanced with Scheduler Detection + DEX-Specific Amounts + Comprehensive Logging',
     poolCheckInterval: POOL_CHECK_INTERVAL,
     positionDisplayInterval: POSITION_DISPLAY_INTERVAL,
     dexConfigCount: Object.keys(DEX_SWAP_AMOUNTS).length - 1,
-    monitoringFile: SENT_POOLS_FILE
+    monitoringFile: SENT_POOLS_FILE,
+    schedulerEnabled: true // ✅ NEW FLAG
   });
 
-  console.log("🚀 Pool Orchestrator Daemon Started (Enhanced with DEX-Specific Amounts)");
-  console.log("=".repeat(70));
+  console.log("🚀 Pool Orchestrator Daemon Started (Enhanced with Scheduler Detection)");
+  console.log("=".repeat(80));
   
   // Display DEX configuration
   displayDexConfiguration();
   
-  console.log("=".repeat(70));
+  console.log("=".repeat(80));
   console.log(`⏰ Pool check interval: ${POOL_CHECK_INTERVAL / 1000}s`);
   console.log(`📊 Position display interval: ${POSITION_DISPLAY_INTERVAL / 1000}s`);
   console.log(`📁 Monitoring file: ${SENT_POOLS_FILE}`);
   console.log(`📋 Logging directory: ./logs/`);
-  console.log(`🔄 Processing mode: Enhanced Sequential Queue with DEX-Specific Amounts + Comprehensive Logging`);
-  console.log("=".repeat(70));
+  console.log(`🔄 Processing mode: Enhanced Sequential Queue with Scheduler Detection + DEX-Specific Amounts + Comprehensive Logging`);
+  console.log(`🎯 New Feature: Only pools with active fee schedulers will be processed`);
+  console.log("=".repeat(80));
 
   displayLogStats();
 
@@ -2040,37 +2237,43 @@ async function startDaemon() {
       symbolMappings: symbol_global.size
     });
 
-    const eligiblePools = filterPools(poolsData);
+        // ✅ PERBAIKAN: Initial snapshot dengan basic filter (tanpa scheduler check)
+    console.log(`\n🔧 Creating initial snapshot with basic filtering...`);
+    const eligiblePools = await filterPoolsBasic(poolsData); // ✅ Basic filter saja
     eligiblePools.forEach(pool => {
       initialPoolSnapshot.add(pool.pool_address);
-      poolProcessingState.set(pool.pool_address, "completed");
+      poolProcessingState.set(pool.pool_address, "completed"); // Mark as completed
     });
 
     snapshotCreated = true;
 
-    logActivity('SYSTEM', 'Initial snapshot created', {
+    logActivity('SYSTEM', 'Initial snapshot created with basic filtering', {
       totalPoolsInFile: poolsData.length,
-      eligiblePools: eligiblePools.length,
+      eligiblePoolsBasic: eligiblePools.length,
       snapshotSize: initialPoolSnapshot.size,
-      strategy: 'Only new pools will be processed'
+      strategy: 'Only truly new pools will be checked for schedulers',
+      schedulerCheckOnNewOnly: true
     });
   }
 
   await displayActivePositions();
 
-  logSuccess('SYSTEM', 'Daemon ready - waiting for new pools', {
+  logSuccess('SYSTEM', 'Daemon ready - waiting for new pools with schedulers', {
     monitoringFile: SENT_POOLS_FILE,
     initialSnapshot: initialPoolSnapshot.size,
-    dexConfiguredCount: Object.keys(DEX_SWAP_AMOUNTS).length - 1
+    dexConfiguredCount: Object.keys(DEX_SWAP_AMOUNTS).length - 1,
+    schedulerFilteringEnabled: true
   });
 
-  const poolCheckInterval = setInterval(checkAndProcessPools, POOL_CHECK_INTERVAL);
+  // ✅ CRITICAL FIX: Use enhanced functions in intervals
+  const poolCheckInterval = setInterval(checkAndProcessPoolsEnhanced, POOL_CHECK_INTERVAL);
   const positionDisplayInterval = setInterval(displayActivePositions, POSITION_DISPLAY_INTERVAL);
 
-  logActivity('SYSTEM', 'Daemon intervals started', {
+  logActivity('SYSTEM', 'Daemon intervals started with scheduler detection', {
     poolCheckInterval: POOL_CHECK_INTERVAL,
     positionDisplayInterval: POSITION_DISPLAY_INTERVAL,
-    dexSwapAmounts: DEX_SWAP_AMOUNTS
+    dexSwapAmounts: DEX_SWAP_AMOUNTS,
+    schedulerEnabled: true
   });
 
   process.on('SIGINT', () => {
@@ -2089,13 +2292,14 @@ async function startDaemon() {
       stuck: Array.from(poolProcessingState.values()).filter(state => state === "failed_stuck").length,
       queueRemaining: poolQueue.length,
       totalPositions: positionCount,
-      dexConfigCount: Object.keys(DEX_SWAP_AMOUNTS).length - 1
+      dexConfigCount: Object.keys(DEX_SWAP_AMOUNTS).length - 1,
+      schedulerEnabled: true
     };
 
-    logActivity('SYSTEM', 'Final daemon statistics', finalStats);
+    logActivity('SYSTEM', 'Final daemon statistics with scheduler', finalStats);
     displayLogStats();
 
-    console.log('\n📊 === FINAL STATISTICS ===');
+    console.log('\n📊 === FINAL STATISTICS (WITH SCHEDULER DETECTION) ===');
     Object.entries(finalStats).forEach(([key, value]) => {
       console.log(`${key}: ${value}`);
     });
@@ -2112,7 +2316,8 @@ startDaemon().catch(error => {
   logError('SYSTEM', 'Daemon failed to start', error, {
     timestamp: getDetailedTimestamp(),
     nodeVersion: process.version,
-    platform: process.platform
+    platform: process.platform,
+    schedulerEnabled: true
   });
   console.error("💥 Daemon failed to start:", error.message);
   process.exit(1);
